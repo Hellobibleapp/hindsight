@@ -977,3 +977,19 @@ def test_worker_reserved_and_legacy_both_set_is_rejected(monkeypatch):
 
     with pytest.raises(ValueError, match="RESERVED_SLOTS"):
         HindsightConfig.from_env()
+
+
+def test_per_bank_vector_index_settings_reject_negative_values(monkeypatch):
+    """Both settings use 0 as "off", so a negative value is a typo rather than an intent."""
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    monkeypatch.setenv("HINDSIGHT_API_PER_BANK_VECTOR_INDEX_MIN_ROWS", "-1")
+    with pytest.raises(ValueError, match="per_bank_vector_index_min_rows"):
+        HindsightConfig.from_env()
+
+    monkeypatch.setenv("HINDSIGHT_API_PER_BANK_VECTOR_INDEX_MIN_ROWS", "0")
+    monkeypatch.setenv("HINDSIGHT_API_PER_BANK_VECTOR_INDEX_CACHE_TTL_SECONDS", "-1")
+    with pytest.raises(ValueError, match="per_bank_vector_index_cache_ttl_seconds"):
+        HindsightConfig.from_env()

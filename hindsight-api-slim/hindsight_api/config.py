@@ -527,6 +527,8 @@ ENV_RERANKER_GOOGLE_PROJECT_ID = "HINDSIGHT_API_RERANKER_GOOGLE_PROJECT_ID"
 ENV_RERANKER_GOOGLE_SERVICE_ACCOUNT_KEY = "HINDSIGHT_API_RERANKER_GOOGLE_SERVICE_ACCOUNT_KEY"
 
 ENV_VECTOR_EXTENSION = "HINDSIGHT_API_VECTOR_EXTENSION"
+ENV_PER_BANK_VECTOR_INDEX_MIN_ROWS = "HINDSIGHT_API_PER_BANK_VECTOR_INDEX_MIN_ROWS"
+ENV_PER_BANK_VECTOR_INDEX_CACHE_TTL_SECONDS = "HINDSIGHT_API_PER_BANK_VECTOR_INDEX_CACHE_TTL_SECONDS"
 ENV_TEXT_SEARCH_EXTENSION = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION"
 ENV_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE"
 ENV_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER"
@@ -1129,6 +1131,16 @@ DEFAULT_RERANKER_GOOGLE_MODEL = "semantic-ranker-default-004"
 
 # Vector extension (pgvector, vchord, pgvectorscale, or AlloyDB ScaNN)
 DEFAULT_VECTOR_EXTENSION = "pgvector"  # Options: "pgvector", "vchord", "pgvectorscale", "scann"
+
+# Minimum fact rows a bank must hold before it gets its own partial vector indexes.
+# 0 gives every bank its indexes at creation time and never evaluates the threshold.
+# Above 0, bank creation leaves them out and each consolidation reconciles the bank
+# against this value, creating or dropping as it crosses.
+DEFAULT_PER_BANK_VECTOR_INDEX_MIN_ROWS = 0
+
+# How long a bank's memory count is reused before the database is read again. A bank that grows past
+# the threshold, and a threshold that moves, are both picked up on the next read rather than at once.
+DEFAULT_PER_BANK_VECTOR_INDEX_CACHE_TTL_SECONDS = 10800
 
 # Text search extension (native PostgreSQL, vchord BM25, Timescale pg_textsearch,
 # pgroonga, or ParadeDB pg_search)
@@ -2127,6 +2139,11 @@ class HindsightConfig:
     migration_database_url: str | None
     database_schema: str
     vector_extension: str  # "pgvector", "vchord", "pgvectorscale", or "scann"
+    # Minimum fact rows before a bank gets its own partial vector indexes.
+    # 0 = disabled: every bank gets them at creation time. Read from the server environment.
+    per_bank_vector_index_min_rows: int
+    # Seconds a bank's memory count is reused for. 0 reads the database on every consolidation.
+    per_bank_vector_index_cache_ttl_seconds: int
     text_search_extension: str  # "native", "vchord", "pg_textsearch", "pgroonga", or "pg_search"
     # PostgreSQL text search dictionary for the "native" backend (ignored by
     # other backends). Only the "native" backend reads this field; pgroonga
@@ -2931,6 +2948,16 @@ class HindsightConfig:
         # Validate vector_extension
         validate_extension(self.vector_extension)
 
+        if self.per_bank_vector_index_min_rows < 0:
+            raise ValueError(
+                f"Invalid per_bank_vector_index_min_rows: {self.per_bank_vector_index_min_rows}. Must be >= 0"
+            )
+
+        if self.per_bank_vector_index_cache_ttl_seconds < 0:
+            raise ValueError(
+                f"Invalid per_bank_vector_index_cache_ttl_seconds: {self.per_bank_vector_index_cache_ttl_seconds}. Must be >= 0"
+            )
+
         # pg_trgm requires the similarity threshold in (0, 1]. Fail fast here
         # rather than let an out-of-range value raise on every pool connection's
         # setup (which would leave the API unable to serve any request).
@@ -3099,6 +3126,14 @@ class HindsightConfig:
             migration_database_url=os.getenv(ENV_MIGRATION_DATABASE_URL) or None,
             database_schema=os.getenv(ENV_DATABASE_SCHEMA, DEFAULT_DATABASE_SCHEMA),
             vector_extension=os.getenv(ENV_VECTOR_EXTENSION, DEFAULT_VECTOR_EXTENSION).lower(),
+            per_bank_vector_index_min_rows=int(
+                os.getenv(ENV_PER_BANK_VECTOR_INDEX_MIN_ROWS, str(DEFAULT_PER_BANK_VECTOR_INDEX_MIN_ROWS))
+            ),
+            per_bank_vector_index_cache_ttl_seconds=int(
+                os.getenv(
+                    ENV_PER_BANK_VECTOR_INDEX_CACHE_TTL_SECONDS, str(DEFAULT_PER_BANK_VECTOR_INDEX_CACHE_TTL_SECONDS)
+                )
+            ),
             text_search_extension=os.getenv(ENV_TEXT_SEARCH_EXTENSION, DEFAULT_TEXT_SEARCH_EXTENSION).lower(),
             text_search_extension_native_language=os.getenv(
                 ENV_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE,
