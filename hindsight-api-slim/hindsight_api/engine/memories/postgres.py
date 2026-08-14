@@ -325,6 +325,9 @@ class PostgresMemories(MemoriesExtension):
     async def count_memories(self, *, conn, fq_table, bank_id: str) -> dict[str, int]:
         return await reads.count_memories(conn=conn, fq_table=fq_table, bank_id=bank_id)
 
+    async def count_memories_capped(self, *, conn, fq_table, bank_id: str, limit: int) -> int:
+        return await reads.count_memories_capped(conn=conn, fq_table=fq_table, bank_id=bank_id, limit=limit)
+
     async def list_tags(
         self,
         *,

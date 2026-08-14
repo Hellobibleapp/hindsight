@@ -285,6 +285,26 @@ async def count_memories(*, conn, fq_table: Callable[[str], str], bank_id: str) 
     return {row["fact_type"]: int(row["count"]) for row in rows}
 
 
+async def count_memories_capped(*, conn, fq_table: Callable[[str], str], bank_id: str, limit: int) -> int:
+    """Bounded ``COUNT(*)`` of a bank's memories, capped at ``limit``.
+
+    The inner ``LIMIT`` stops the index scan there, so a large bank costs the same as ``limit`` rows
+    instead of its own size. Same shape as :func:`count_unconsolidated`.
+    """
+    row = await conn.fetchrow(
+        f"""
+        SELECT COUNT(*) AS c FROM (
+            SELECT 1 FROM {fq_table("memory_units")}
+            WHERE bank_id = $1
+            LIMIT $2
+        ) sub
+        """,
+        bank_id,
+        limit,
+    )
+    return int(row["c"]) if row else 0
+
+
 async def list_tags(
     *,
     conn,
