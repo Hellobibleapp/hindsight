@@ -145,6 +145,28 @@ sum(rate(hindsight_retain_documents_total{outcome="no_facts"}[15m]))
   / sum(rate(hindsight_retain_documents_total[15m]))
 ```
 
+### Vector Index Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `hindsight.vector_index.reconciliations.total` | Counter | outcome, bank_id | Per-bank vector index reconciliations, by what they did |
+
+**Labels:**
+- `outcome`: `created` when a bank crossed [the row threshold](configuration.md#vector-extension), `dropped` when it fell below it, `unusable` when the bank was left alone
+- `bank_id`: Memory bank identifier
+
+Only emitted when `HINDSIGHT_API_PER_BANK_VECTOR_INDEX_MIN_ROWS` is above `0`. `created` and `dropped` should
+settle once a deployment has converged; banks that keep flipping mean the threshold sits inside their
+working range, and the churn costs an index build each way.
+
+`outcome="unusable"` is the one to alert on. The bank has an index that is neither absent nor usable —
+a build still running, or one that died — so it was left alone, and a bank that stays there never gets
+the index its size calls for:
+
+```promql
+sum(rate(hindsight_vector_index_reconciliations_total{outcome="unusable"}[1h]))
+```
+
 ### LLM Metrics
 
 | Metric | Type | Labels | Description |
