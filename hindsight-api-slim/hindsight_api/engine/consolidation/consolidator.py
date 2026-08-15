@@ -46,6 +46,7 @@ from ..llm_wrapper import sanitize_llm_output
 from ..memories import FactRecord, get_memories
 from ..memory_engine import Budget, fq_table
 from ..retain import embedding_utils
+from ..retain.bank_utils import reconcile_bank_vector_indexes
 from .prompts import (
     build_consolidation_input,
     build_consolidation_system_prompt,
@@ -1183,6 +1184,13 @@ async def run_consolidation_job(
     # Build a configured LLM wrapper that applies per-bank settings (e.g. safety settings)
     # to every call without leaking across operations.
     llm_config = memory_engine._consolidation_llm_config.with_config(config, bank_id=bank_id, operation="consolidation")
+
+    # A consolidation follows the writes that changed the bank's size, so it is where a row
+    # threshold gets to look again. Best-effort: an index must never fail a write.
+    try:
+        await reconcile_bank_vector_indexes(memory_engine._backend, bank_id=bank_id, ops=memory_engine._backend.ops)
+    except Exception as exc:  # noqa: BLE001 — reconciliation is best-effort, retried next round
+        logger.warning("Vector index reconciliation failed for bank %s: %s", bank_id, exc)
 
     # Bind the operation trace context for the whole run so the create/update DB
     # sites (deep inside _process_memory_batch) can accumulate the observations
