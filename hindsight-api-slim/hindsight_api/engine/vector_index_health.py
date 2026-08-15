@@ -19,6 +19,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..config import get_config
 from .db_utils import retry_with_backoff
 from .retain.bank_utils import _BANK_INDEX_FACT_TYPES, _bank_index_name
 
@@ -54,6 +55,7 @@ class SchemaVectorIndexResult:
     already_present: int = 0
     created: int = 0
     skipped: int = 0  # would-create, reported under --dry-run
+    below_threshold: int = 0  # banks left alone: too small for the configured row threshold
     failed: int = 0
     failed_indexes: list[str] = field(default_factory=list)
 
@@ -116,6 +118,26 @@ async def _repair_schema(
     else:
         banks = await conn.fetch(f"SELECT bank_id, internal_id FROM {qschema}.banks ORDER BY bank_id")  # noqa: S608
     result.banks_scanned = len(banks)
+
+    # A configured row threshold means a small bank is *meant* to have no indexes: repairing it back
+    # would undo the reconciler, and reporting it as missing would flood the result with banks that
+    # are in the state they should be in. One aggregate answers for every bank at once — a full scan
+    # of memory_units, which is nothing next to the index builds this command is here to run.
+    threshold = get_config().per_bank_vector_index_min_rows
+    if threshold > 0 and banks:
+        scope = " WHERE bank_id = $2" if bank_id is not None else ""
+        args = [threshold, bank_id] if bank_id is not None else [threshold]
+        eligible = {
+            row["bank_id"]
+            for row in await conn.fetch(
+                f"SELECT bank_id FROM {qschema}.memory_units{scope} "  # noqa: S608 — schema is a quoted identifier
+                f"GROUP BY bank_id HAVING COUNT(*) >= $1",
+                *args,
+            )
+        }
+        kept = [bank for bank in banks if bank["bank_id"] in eligible]
+        result.below_threshold = len(banks) - len(kept)
+        banks = kept
 
     # Resolve expected index names for every bank, then check them all in one
     # catalog query rather than one round-trip per index.

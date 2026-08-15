@@ -637,6 +637,8 @@ async def _run_repair_bank(
             typer.echo(
                 f"  schema '{result.schema}': {result.banks_scanned} bank(s) scanned, "
                 f"{result.already_present} present, {result.created} created, "
+                # Only when a row threshold is configured — silent for everyone else.
+                f"{f'{result.below_threshold} below threshold, ' if result.below_threshold else ''}"
                 f"{result.skipped} to-create (dry-run), {result.failed} failed"
             )
         return results
@@ -717,10 +719,12 @@ def repair_bank(
     total_present = sum(r.already_present for r in results)
     total_created = sum(r.created for r in results)
     total_skipped = sum(r.skipped for r in results)
+    total_below = sum(r.below_threshold for r in results)
     total_failed = sum(r.failed for r in results)
     typer.echo(
         f"Done: {len(results)} schema(s), {total_banks} bank(s) scanned, "
         f"{total_present} already present, {total_created} created, "
+        f"{f'{total_below} below threshold, ' if total_below else ''}"
         f"{total_skipped} to-create (dry-run), {total_failed} failed"
     )
     if total_failed:
