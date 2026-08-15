@@ -568,7 +568,17 @@ async def import_bank(
         # post-filter (slower, under-returning recall). See #2645.
         internal_id = await conn.fetchval(f"SELECT internal_id FROM {fq_table('banks')} WHERE bank_id = $1", bank_id)
         if internal_id is not None:
-            await bank_utils.create_bank_vector_indexes(conn, bank_id, str(internal_id), ops=ops)
+            await bank_utils.create_bank_vector_indexes(
+                conn,
+                bank_id,
+                str(internal_id),
+                ops=ops,
+                # The manifest carries the archive's own counts, so a row threshold can judge the
+                # bank it is about to become — here, while it is still empty and the build is free —
+                # rather than wait for a consolidation to notice it arrived full. Facts and
+                # observations are counted separately on export and both land in memory_units.
+                rows=parsed.manifest.fact_count + parsed.manifest.observation_count,
+            )
 
     # Only now does the bank row — and with it the archive's own config — exist, so
     # this is where the config the documents are replayed with has to come from.

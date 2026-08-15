@@ -18,7 +18,11 @@ Everything asserted is deterministic (index presence/shape via the catalog) —
 no LLM is needed, so memory_units are inserted directly.
 """
 
+import io
+import json
 import uuid
+import zipfile
+from types import SimpleNamespace
 
 import pytest
 from asyncpg.exceptions import DeadlockDetectedError
@@ -26,6 +30,7 @@ from asyncpg.exceptions import DeadlockDetectedError
 from hindsight_api import RequestContext
 from hindsight_api.admin import cli
 from hindsight_api.admin.cli import _run_repair_bank
+from hindsight_api.config import get_config
 from hindsight_api.engine.db_utils import acquire_with_retry, retry_with_backoff
 from hindsight_api.engine.memory_engine import MemoryEngine
 from hindsight_api.engine.retain.bank_utils import _BANK_INDEX_FACT_TYPES, _bank_index_name, _vector_index_clause
@@ -344,6 +349,38 @@ class TestRepairBankCommand:
             await memory.delete_bank(bank_id, request_context=request_context)
 
 
+class TestRepairHonoursTheRowThreshold:
+    @pytest.mark.asyncio
+    async def test_a_bank_below_the_threshold_is_left_without_indexes(
+        self, memory: MemoryEngine, request_context: RequestContext, monkeypatch
+    ):
+        """Repair must not undo the threshold: a small bank is *meant* to have no indexes.
+
+        Without this, running repair-bank after enabling the threshold puts back every index the
+        reconciler dropped — and reports each small bank as missing them in the meantime.
+        """
+        bank_id = await _seed_bank(memory, request_context)
+        backend = await memory._get_backend()
+        monkeypatch.setattr(
+            "hindsight_api.engine.vector_index_health.get_config",
+            lambda: SimpleNamespace(per_bank_vector_index_min_rows=1000),
+        )
+        try:
+            async with acquire_with_retry(backend) as conn:
+                names = await _drop_bank_indexes(conn, bank_id)
+                result = await _repair_schema(
+                    conn, _TEST_SCHEMA, _vector_index_clause(), dry_run=False, bank_id=bank_id
+                )
+
+                assert result.below_threshold == 1
+                assert result.created == 0
+                assert result.skipped == 0  # not reported as missing either
+                for name in names:
+                    assert not await _index_exists(conn, name)
+        finally:
+            await memory.delete_bank(bank_id, request_context=request_context)
+
+
 class TestImportBankCreatesIndexes:
     @pytest.mark.asyncio
     async def test_import_bank_creates_per_bank_indexes(self, memory: MemoryEngine, request_context: RequestContext):
@@ -381,5 +418,48 @@ class TestImportBankCreatesIndexes:
                     assert await _index_is_partial_vector(conn, name), (
                         f"{name} should exist after import-bank (the restore leak, #2645)"
                     )
+        finally:
+            await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_an_archive_above_the_threshold_is_indexed_on_restore(
+        self, memory: MemoryEngine, request_context: RequestContext, monkeypatch
+    ):
+        """A restored bank arrives full, so the threshold judges it on the size it is about to be.
+
+        The archive's own fact count is known before any of it is replayed — while the bank is still
+        empty and the build is free. Judging it on the rows present at that instant (none) would leave
+        a large restored bank on exact scans until some later consolidation noticed.
+        """
+        bank_id = f"test-import-threshold-{uuid.uuid4().hex[:8]}"
+        backend = await memory._get_backend()
+        try:
+            # Seeded through retain, not by inserting rows: the manifest counts what the archive
+            # carries through its documents, so memories with no document behind them report zero.
+            await memory.retain_async(
+                bank_id=bank_id, content="Alice works at Google.", context="Test", request_context=request_context
+            )
+            async with acquire_with_retry(backend) as conn:
+                archive = await export_bank(conn, bank_id)
+
+            manifest_rows = json.loads(zipfile.ZipFile(io.BytesIO(archive)).read("manifest.json"))
+            archive_size = manifest_rows["fact_count"] + manifest_rows["observation_count"]
+            assert archive_size > 0, "the archive must report the size the threshold will judge"
+
+            await memory.delete_bank(bank_id, request_context=request_context)
+            monkeypatch.setattr(
+                "hindsight_api.engine.retain.bank_utils.get_config",
+                lambda: SimpleNamespace(
+                    per_bank_vector_index_min_rows=archive_size,
+                    per_bank_vector_index_cache_ttl_seconds=0,
+                    bank_stats_cache_max_entries=1000,
+                    vector_extension=get_config().vector_extension,
+                ),
+            )
+            await memory.import_bank_async(archive, request_context)
+
+            async with acquire_with_retry(backend) as conn:
+                for name in await _expected_index_names(conn, bank_id):
+                    assert await _index_is_partial_vector(conn, name)
         finally:
             await memory.delete_bank(bank_id, request_context=request_context)

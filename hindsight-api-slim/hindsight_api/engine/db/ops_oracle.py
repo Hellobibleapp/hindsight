@@ -837,6 +837,8 @@ class OracleOps(DataAccessOps):
         internal_id: str,
         index_clause: str,
         fact_types: dict[str, str],
+        *,
+        concurrently: bool = False,
     ) -> None:
         # Oracle 23ai supports HNSW vector indexes but does NOT support partial
         # indexes (WHERE clause on CREATE INDEX for vector indexes). Uses a single

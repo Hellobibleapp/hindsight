@@ -4,15 +4,18 @@ Tests for per-bank vector index lifecycle and UNION ALL retrieval.
 Covers:
 - _bank_index_name deterministic naming
 - Per-bank vector indexes created on bank creation (retain_async / ensure_bank_exists)
+- Per-bank vector indexes held back on a new bank when a row threshold is configured
 - Per-bank vector indexes dropped on bank deletion
 - retrieve_semantic_bm25_combined_sql groups results correctly by fact_type and source
 """
 
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
+from hindsight_api.config import get_config
 from hindsight_api.engine.retain.bank_utils import _BANK_INDEX_FACT_TYPES, _bank_index_name
 
 # ---------------------------------------------------------------------------
@@ -79,6 +82,39 @@ async def _get_bank_vector_indexes(pool, bank_id: str) -> list[str]:
 
 
 @pytest.mark.asyncio
+async def test_a_concurrent_build_gets_the_statement_budget_not_the_query_one():
+    """A build over a populated bank outlives the pool's per-command timeout, which is sized for queries.
+
+    Pinned at the call rather than on the helper: what regresses silently is the timeout not reaching
+    ``execute``, leaving a large bank cancelled at 60s and retried forever.
+    """
+    from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
+
+    calls: list[float | None] = []
+
+    class _RecordingConn:
+        async def execute(self, query, *args, timeout=None):
+            calls.append(timeout)
+
+    ops = PostgreSQLOps()
+    await ops.create_bank_vector_indexes(
+        _RecordingConn(), "memory_units", "b", "0" * 32, "USING hnsw (embedding vector_cosine_ops)", {"world": "worl"}
+    )
+    assert calls == [None]  # bank creation: instant on an empty bank, the pool's own timeout is fine
+
+    await ops.create_bank_vector_indexes(
+        _RecordingConn(),
+        "memory_units",
+        "b",
+        "0" * 32,
+        "USING hnsw (embedding vector_cosine_ops)",
+        {"world": "worl"},
+        concurrently=True,
+    )
+    assert calls[1] == float(get_config().db_statement_timeout)
+
+
+@pytest.mark.asyncio
 async def test_retain_creates_per_bank_vector_indexes(memory, request_context):
     """retain_async on a new bank must create 3 per-(bank, fact_type) vector indexes."""
     bank_id = f"test_hnsw_create_{uuid.uuid4().hex[:8]}"
@@ -94,6 +130,31 @@ async def test_retain_creates_per_bank_vector_indexes(memory, request_context):
             assert any(ft_short in idx for idx in indexes), (
                 f"Missing index for fact_type short '{ft_short}' in {indexes}"
             )
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_an_armed_threshold_leaves_a_new_bank_without_indexes(memory, request_context, monkeypatch):
+    """A new bank is empty, so an armed threshold holds its indexes back until it grows into them."""
+    real = get_config()
+    monkeypatch.setattr(
+        "hindsight_api.engine.retain.bank_utils.get_config",
+        lambda: SimpleNamespace(
+            per_bank_vector_index_min_rows=1000,
+            per_bank_vector_index_cache_ttl_seconds=0,
+            bank_stats_cache_max_entries=real.bank_stats_cache_max_entries,
+            vector_extension=real.vector_extension,
+        ),
+    )
+    bank_id = f"test_hnsw_threshold_{uuid.uuid4().hex[:8]}"
+    try:
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="Alice is a software engineer.",
+            request_context=request_context,
+        )
+        assert await _get_bank_vector_indexes(memory._pool, bank_id) == []
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
 
