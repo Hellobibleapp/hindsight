@@ -300,6 +300,10 @@ class MetricsCollectorBase:
         """Record how long a caller waited to acquire a pooled DB connection."""
         raise NotImplementedError
 
+    def record_vector_index_reconciliation(self, bank_id: str, outcome: str):
+        """Record one bank's per-bank vector index reconciliation, by what it did."""
+        raise NotImplementedError
+
     def record_loop_stall(self, stall_seconds: float):
         """Record a detected event-loop stall (blocked longer than the watchdog threshold)."""
         raise NotImplementedError
@@ -363,6 +367,10 @@ class NoOpMetricsCollector(MetricsCollectorBase):
 
     def record_db_acquire_wait(self, wait_seconds: float):
         """No-op DB acquire-wait recording."""
+        pass
+
+    def record_vector_index_reconciliation(self, bank_id: str, outcome: str):
+        """No-op vector index reconciliation recording."""
         pass
 
     def record_loop_stall(self, stall_seconds: float):
@@ -445,6 +453,17 @@ class MetricsCollector(MetricsCollectorBase):
             name="hindsight.retain.documents.total",
             description="Documents processed by retain, labelled by extraction outcome (facts/no_facts)",
             unit="documents",
+        )
+
+        # Per-bank vector index reconciliation, when a row threshold is configured. `created` and
+        # `dropped` should settle once a deployment has converged: banks that keep flipping mean the
+        # threshold sits inside their working range. `unusable` is the one to alert on — the bank was
+        # left alone because a build was in flight or had died, and a bank that stays there never
+        # gets the index its size calls for.
+        self.vector_index_reconciliations_total = self.meter.create_counter(
+            name="hindsight.vector_index.reconciliations.total",
+            description="Per-bank vector index reconciliations, labelled by outcome (created/dropped/unusable)",
+            unit="reconciliations",
         )
 
         # HTTP request metrics
@@ -598,6 +617,14 @@ class MetricsCollector(MetricsCollectorBase):
             attributes["bank_id"] = bank_id
 
         self.retain_documents_total.add(1, attributes)
+
+    def record_vector_index_reconciliation(self, bank_id: str, outcome: str):
+        """Record one bank's per-bank vector index reconciliation, by what it did."""
+        attributes = {"tenant": _get_tenant(), "outcome": outcome}
+        if self._include_bank_id:
+            attributes["bank_id"] = bank_id
+
+        self.vector_index_reconciliations_total.add(1, attributes)
 
     def record_llm_call(
         self,

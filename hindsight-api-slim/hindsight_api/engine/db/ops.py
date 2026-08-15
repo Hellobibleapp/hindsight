@@ -490,11 +490,17 @@ class DataAccessOps(ABC):
         internal_id: str,
         index_clause: str,
         fact_types: dict[str, str],
+        *,
+        concurrently: bool = False,
     ) -> None:
         """Create per-bank partial vector indexes.
 
         PG creates per-(bank, fact_type) partial indexes.
         Non-PG is a no-op (uses global index).
+
+        ``concurrently`` builds without an ACCESS EXCLUSIVE lock on the shared table, for a bank
+        that already holds rows. It requires an autocommit connection: CONCURRENTLY cannot run
+        inside a transaction block.
         """
         ...
 

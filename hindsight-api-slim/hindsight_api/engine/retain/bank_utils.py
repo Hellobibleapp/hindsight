@@ -1,18 +1,19 @@
-"""
-bank profile utilities for disposition and mission management.
-"""
+"""Bank profile utilities, and the per-bank vector indexes a bank's lifecycle keeps in step."""
 
 import json
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from typing import TypedDict
 
 from pydantic import BaseModel, Field
 
 from ..._vector_index import index_using_clause, uses_per_bank_vector_indexes
 from ...config import get_config
+from ...metrics import get_metrics_collector
+from ..bank_stats_cache import BankStatsCache
 from ..db_utils import acquire_with_retry, retry_with_backoff
 from ..memory_engine import fq_table, get_current_schema
 from ..response_models import DispositionTraits
@@ -27,6 +28,33 @@ _BANK_INDEX_FACT_TYPES: dict[str, str] = {
 }
 
 
+class _IndexState(Enum):
+    """What a bank's set of per-(bank, fact_type) vector indexes looks like right now."""
+
+    ABSENT = "absent"
+    READY = "ready"
+    #: Present but not all usable — a build in flight, or one that died. The two are indistinguishable
+    #: from the catalog, so a caller can only leave the bank alone.
+    UNUSABLE = "unusable"
+
+
+# A bank's memory count is the one read here that scans the shared memory_units table, so it is the
+# one worth not repeating for a bank that consolidates several times in a session. Built on first use
+# because it needs the resolved config; bounded and coalesced by the cache itself.
+_memory_count_cache_instance: BankStatsCache | None = None
+
+
+def _memory_count_cache(config) -> BankStatsCache:
+    global _memory_count_cache_instance
+    if _memory_count_cache_instance is None:
+        _memory_count_cache_instance = BankStatsCache(
+            ttl_seconds=config.per_bank_vector_index_cache_ttl_seconds,
+            # Same purpose as the stats cache's own bound, so it takes the same setting.
+            max_entries=config.bank_stats_cache_max_entries,
+        )
+    return _memory_count_cache_instance
+
+
 def _bank_index_name(ft: str, internal_id: str) -> str:
     """Deterministic, schema-safe vector index name for a (bank, fact_type) pair.
 
@@ -37,6 +65,26 @@ def _bank_index_name(ft: str, internal_id: str) -> str:
     return f"idx_mu_emb_{_BANK_INDEX_FACT_TYPES[ft]}_{uid}"
 
 
+async def _bank_indexes_state(conn, schema: str, internal_id: str) -> _IndexState:
+    """Read whether a bank's full set of vector indexes exists and is usable."""
+    names = [_bank_index_name(ft, internal_id) for ft in _BANK_INDEX_FACT_TYPES]
+    row = await conn.fetchrow(
+        "SELECT COUNT(*) AS found, COUNT(*) FILTER (WHERE i.indisvalid) AS usable "
+        "FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "JOIN pg_index i ON i.indexrelid = c.oid "
+        "WHERE n.nspname = $1 AND c.relname = ANY($2::text[])",
+        schema,
+        names,
+    )
+    found, usable = (int(row["found"]), int(row["usable"])) if row else (0, 0)
+    if found == 0:
+        return _IndexState.ABSENT
+    if usable == len(names):
+        return _IndexState.READY
+    return _IndexState.UNUSABLE
+
+
 def _vector_index_clause() -> str | None:
     """Return the USING clause for per-bank vector indexes, if this backend uses them."""
     ext = get_config().vector_extension
@@ -45,8 +93,14 @@ def _vector_index_clause() -> str | None:
     return index_using_clause(ext)
 
 
-async def create_bank_vector_indexes(conn, bank_id: str, internal_id: str, ops=None) -> None:
-    """Create per-(bank, fact_type) partial vector indexes for a newly created bank.
+async def create_bank_vector_indexes(
+    conn, bank_id: str, internal_id: str, ops=None, *, rows: int = 0, concurrently: bool = False
+) -> None:
+    """Create per-(bank, fact_type) partial vector indexes for a bank holding ``rows`` memories.
+
+    A bank gets its indexes once it holds ``per_bank_vector_index_min_rows`` of them. ``rows``
+    defaults to 0 — a bank being created is empty — so at the default threshold of 0 every bank
+    qualifies, and above it a new bank waits for the reconciler to find it past the threshold.
 
     Respects the HINDSIGHT_API_VECTOR_EXTENSION config to use the appropriate
     index type (HNSW for pgvector, DiskANN for pgvectorscale, vchordrq for vchord).
@@ -65,6 +119,9 @@ async def create_bank_vector_indexes(conn, bank_id: str, internal_id: str, ops=N
         logger.debug("Skipping per-bank vector indexes for configured backend")
         return
 
+    if rows < get_config().per_bank_vector_index_min_rows:
+        return
+
     await ops.create_bank_vector_indexes(
         conn,
         fq_table("memory_units"),
@@ -72,6 +129,7 @@ async def create_bank_vector_indexes(conn, bank_id: str, internal_id: str, ops=N
         internal_id,
         index_clause,
         _BANK_INDEX_FACT_TYPES,
+        concurrently=concurrently,
     )
 
 
@@ -521,3 +579,71 @@ async def list_banks(pool) -> list:
 
         result.sort(key=lambda bank: sort_keys[bank["bank_id"]], reverse=True)
         return result
+
+
+async def reconcile_bank_vector_indexes(backend, *, bank_id: str, ops) -> None:
+    """Bring one bank's vector indexes in line with the configured row threshold.
+
+    Creates them once the bank holds ``per_bank_vector_index_min_rows`` memories and drops them
+    once it holds fewer. A threshold of 0 disables the mechanism, leaving indexes to bank creation.
+
+    One attempt, no retry: the next consolidation comes back to it. Nothing here judges whether an
+    index is sound — a bank whose indexes are not usable is left alone, since a build in flight and
+    a dead one look the same from here.
+
+    The bank's memory count is cached, so a bank that grows past the threshold — or a threshold that
+    moves — is picked up on the next look rather than at once. Its index state is read every time:
+    that one is a catalog lookup, and takes none of the locks a scan of memory_units would.
+
+    Takes its own connection rather than borrowing the caller's, and only once it has something to
+    do: a disabled threshold costs nothing at all, and both the build and the drop need autocommit
+    since CONCURRENTLY cannot run inside a transaction.
+    """
+    from ..memories import get_memories
+
+    config = get_config()
+    threshold = config.per_bank_vector_index_min_rows
+    # The backend is checked on its own: the configured extension is a Postgres extension name
+    # whatever runs underneath, so on Oracle it still reads as one that uses per-bank indexes.
+    if threshold <= 0 or _vector_index_clause() is None or backend.backend_type != "postgresql":
+        return
+
+    schema = get_current_schema()
+    async with acquire_with_retry(backend) as conn:
+        internal_id = await conn.fetchval(f"SELECT internal_id FROM {fq_table('banks')} WHERE bank_id = $1", bank_id)
+        if internal_id is None:
+            return
+        internal_id = str(internal_id)
+
+        state = await _bank_indexes_state(conn, schema, internal_id)
+        if state is _IndexState.UNUSABLE:
+            get_metrics_collector().record_vector_index_reconciliation(bank_id, "unusable")
+            return
+
+        async def _count() -> dict:
+            total = await get_memories().count_memories_capped(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, limit=threshold
+            )
+            return {"count": total}
+
+        # Cached under internal_id, not bank_id: a bank deleted and recreated under the same name gets
+        # a fresh internal_id, so it cannot inherit the previous one's count for the rest of the TTL.
+        cached = await _memory_count_cache(config).get_or_load(schema, internal_id, _count)
+        count = cached["count"]
+        indexed = state is _IndexState.READY
+        wanted = count >= threshold
+
+        if wanted and not indexed:
+            try:
+                await create_bank_vector_indexes(conn, bank_id, internal_id, ops=ops, rows=count, concurrently=True)
+            except Exception:
+                # CONCURRENTLY cannot run in a transaction, so a failed build is not rolled back:
+                # what it leaves behind keeps costing every write without serving a read. Take it.
+                await drop_bank_vector_indexes(conn, internal_id, ops=ops)
+                raise
+            logger.info("Created per-bank vector indexes for %s: reached the %d-row threshold", bank_id, threshold)
+            get_metrics_collector().record_vector_index_reconciliation(bank_id, "created")
+        elif indexed and not wanted:
+            await drop_bank_vector_indexes(conn, internal_id, ops=ops)
+            logger.info("Dropped per-bank vector indexes for %s: below the %d-row threshold", bank_id, threshold)
+            get_metrics_collector().record_vector_index_reconciliation(bank_id, "dropped")

@@ -793,6 +793,15 @@ class MemoriesExtension(Extension, ABC):
     async def count_memories(self, *, conn, fq_table, bank_id: str) -> dict[str, int]:
         """Live memory count per fact_type."""
 
+    async def count_memories_capped(self, *, conn, fq_table, bank_id: str, limit: int) -> int:
+        """How many memories the bank holds, capped at ``limit``.
+
+        Only ever compared against ``limit``, so a store is free to stop counting there. This default
+        sums :meth:`count_memories` and is correct for any store; a SQL store overrides it with a
+        bounded ``COUNT(*)`` costing min(bank size, limit).
+        """
+        return min(sum((await self.count_memories(conn=conn, fq_table=fq_table, bank_id=bank_id)).values()), limit)
+
     @abstractmethod
     async def list_tags(
         self,

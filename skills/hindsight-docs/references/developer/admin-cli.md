@@ -72,7 +72,9 @@ To disable automatic migrations on API startup, set `HINDSIGHT_API_RUN_MIGRATION
 
 Verify and repair a bank's per-`(bank, fact_type)` vector index coverage.
 
-These partial indexes are normally created when a bank is first created (instant on an empty bank), and PostgreSQL maintains them incrementally as the bank grows. A bank that becomes **populated outside that create-time path** — via a logical restore, a cross-version upgrade, or a vector-extension switch — never gets them, so its bank-scoped recall silently falls back to a global index + post-filter. That fallback is both **slower** and can **under-return** results (the approximate nearest-neighbour search draws its candidates from every bank, then filters to yours afterward).
+These partial indexes are normally created when a bank is first created (instant on an empty bank), and PostgreSQL maintains them incrementally as the bank grows. A bank that becomes **populated outside that create-time path** — via a logical restore, a cross-version upgrade, or a vector-extension switch — never gets them, so its bank-scoped recall falls back to an exact scan over the bank's rows. That fallback is **correct but slower**, and it gets slower as the bank grows — on per-bank backends there is no global vector index left to serve it.
+
+When [`HINDSIGHT_API_PER_BANK_VECTOR_INDEX_MIN_ROWS`](configuration.md#vector-extension) is set, a bank below that threshold is *meant* to have no indexes: this command leaves it alone rather than putting back what the threshold withholds, and reports it under `below threshold` instead of creating anything for it.
 
 Run this after any of those events to restore full coverage. It detects **missing or invalid** coverage (an INVALID leftover from an interrupted build, or an index whose type drifted after a backend switch, both count as missing) and rebuilds it with `CREATE INDEX CONCURRENTLY`, so it never blocks live retain/recall/consolidation. It is idempotent and safe to re-run.
 

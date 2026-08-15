@@ -56,6 +56,17 @@ def pg_search_vector_expr(
     return None
 
 
+def _index_ddl_timeout() -> float:
+    """How long a per-bank vector index build or drop may run, in seconds.
+
+    The statement budget the deployment already declares, or the default when that is 0 (no server
+    limit) — the connection is pooled, so an unbounded build would hold one of its slots indefinitely.
+    """
+    from ...config import DEFAULT_DB_STATEMENT_TIMEOUT, get_config
+
+    return float(get_config().db_statement_timeout or DEFAULT_DB_STATEMENT_TIMEOUT)
+
+
 class PostgreSQLOps(DataAccessOps):
     """PostgreSQL-specific data access operations using unnest and LATERAL."""
 
@@ -1055,16 +1066,23 @@ class PostgreSQLOps(DataAccessOps):
         internal_id: str,
         index_clause: str,
         fact_types: dict[str, str],
+        *,
+        concurrently: bool = False,
     ) -> None:
         escaped = bank_id.replace("'", "''")
+        concurrent_clause = "CONCURRENTLY " if concurrently else ""
+        # A build over a populated bank outlives the pool's per-command timeout, which is sized for
+        # queries; it runs under the statement budget the deployment declares instead.
+        timeout = _index_ddl_timeout() if concurrently else None
         async with self._index_ddl_lock(table):
             for ft, suffix in fact_types.items():
                 uid = str(internal_id).replace("-", "")[:16]
                 idx = f"idx_mu_emb_{suffix}_{uid}"
                 await conn.execute(
-                    f"CREATE INDEX IF NOT EXISTS {idx} "
+                    f"CREATE INDEX {concurrent_clause}IF NOT EXISTS {idx} "
                     f"ON {table} {index_clause} "
-                    f"WHERE fact_type = '{ft}' AND bank_id = '{escaped}'"
+                    f"WHERE fact_type = '{ft}' AND bank_id = '{escaped}'",
+                    timeout=timeout,
                 )
 
     async def drop_bank_vector_indexes(
@@ -1086,7 +1104,7 @@ class PostgreSQLOps(DataAccessOps):
             for ft, suffix in fact_types.items():
                 uid = str(internal_id).replace("-", "")[:16]
                 idx = f"idx_mu_emb_{suffix}_{uid}"
-                await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {schema}.{idx}")
+                await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {schema}.{idx}", timeout=_index_ddl_timeout())
 
     def get_entity_resolution_strategy(self) -> str:
         return "trigram"

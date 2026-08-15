@@ -77,6 +77,8 @@ hindsight-admin run-db-migration --schema tenant_acme
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_VECTOR_EXTENSION` | Vector index algorithm: `pgvector`, `vchord`, `pgvectorscale`, or `scann` | `pgvector` |
+| `HINDSIGHT_API_PER_BANK_VECTOR_INDEX_MIN_ROWS` | Minimum fact rows a bank must hold before it gets its own partial vector indexes. `0` gives every bank its indexes at creation time | `0` |
+| `HINDSIGHT_API_PER_BANK_VECTOR_INDEX_CACHE_TTL_SECONDS` | How long a bank's memory count is reused before the database is read again. `0` reads on every consolidation | `10800` |
 
 Hindsight supports four PostgreSQL vector extensions:
 
@@ -132,6 +134,55 @@ Hindsight supports four PostgreSQL vector extensions:
 **When to use scann:**
 - Running on Google **AlloyDB** or **AlloyDB Omni**
 - Want managed ScaNN with `AUTO` mode tuning
+
+**Per-bank index threshold:**
+
+On every backend except `scann`, each bank gets its own partial vector index per fact type at bank-creation
+time. That index only serves its own bank's search arm, while every index on the shared `memory_units` table
+is considered by the planner — and locked — on every query against it. A deployment with many small banks
+therefore pays a table-wide cost for indexes its own planner may not even choose.
+
+`HINDSIGHT_API_PER_BANK_VECTOR_INDEX_MIN_ROWS` sets the number of fact rows a bank must hold before it gets
+its indexes. `0`, the default, gives every bank its indexes at creation time. Above `0`, a bank is judged on
+the rows it holds: a new bank is empty and so starts without them, while a bank restored from an archive is
+judged on the size that archive declares and can get them straight away. From then on each consolidation
+reconciles the bank against the threshold in both directions, so raising or lowering the value converges on
+its own. It is read from the server environment, the same value for every bank — it selects which banks are
+eligible, so a per-bank value would defeat its purpose.
+
+Reconciliation rides on consolidation, so a bank with automatic consolidation disabled is never reconciled
+and keeps whatever index state it has. `hindsight-admin repair-bank` honours the threshold too: it leaves
+a bank below it alone rather than putting back the indexes the threshold is there to withhold.
+Every create and drop is counted, so the mechanism can be watched as it converges — see
+[Vector Index Metrics](monitoring.md#vector-index-metrics).
+
+Counting a bank's memories reads the shared `memory_units` table, so the count is reused for
+`HINDSIGHT_API_PER_BANK_VECTOR_INDEX_CACHE_TTL_SECONDS` (3 hours by default) — a bank consolidating several
+times in one session is counted once. A bank that grows past the threshold is therefore picked up on the
+next count rather than the moment it crosses, and so is a threshold you change: both take up to one
+interval. Lower the TTL to shorten that lag, at the cost of one more count per bank and per interval.
+
+**Choosing a value:**
+
+A bank's own search gets faster with an index from a few hundred rows upward: below that, an exact scan over
+its rows is already quick; above it, the scan grows with the bank while the indexed search stays flat. That
+crossover is not the threshold, though — it only says the index helps *that* bank.
+
+The cost is paid elsewhere. Every index on `memory_units` is considered by the planner on every query against
+the table, whoever it belongs to — on commodity hardware, roughly 5 µs of planning per index per query.
+Equipping one bank adds three indexes, so it slows every other bank's queries slightly, permanently.
+
+So the question is not whether an index helps a bank, but whether it helps that bank more than it costs
+everyone else. With traffic spread evenly over `B` banks, a bank carries its own weight at roughly `10 × B`
+rows: an exact scan costs about 1.5 ms per thousand of a bank's own rows, and that saving is what has to
+exceed the planning surcharge the index imposes on the rest.
+
+That lands far from the local crossover. A deployment with a handful of banks should equip all of them; one
+with thousands should equip only its outliers; one with hundreds of thousands should generally equip none.
+
+In practice: look at how your bank sizes are distributed, pick a threshold that leaves only a small number of
+banks above it, and treat the resulting index count — not the threshold itself — as the number you are
+choosing.
 
 **Switching extensions:**
 

@@ -4,8 +4,10 @@ Per-(bank, fact_type) partial vector indexes are created only when a bank is
 first created (instant on an empty bank). A bank that becomes *populated*
 outside that fresh-INSERT path — via a logical restore, a cross-version upgrade,
 or a vector-extension switch (e.g. ScaNN→pgvector) — never gets them, so its
-bank-scoped recall silently falls back to the global index + post-filter, which
-is both slower and under-returns results. See issue #2645.
+bank-scoped recall falls back to an exact scan over the bank's rows, which grows
+with the bank. See issue #2645. (Migration f2a6d8c4b1e9 dropped the global
+``memory_units`` vector index on per-bank backends, so there is nothing else to
+fall back to.)
 
 This module is the shared engine for detecting and repairing that gap. It is
 driven by the ``repair-bank`` admin command; the build always uses
@@ -19,6 +21,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..config import get_config
 from .db_utils import retry_with_backoff
 from .retain.bank_utils import _BANK_INDEX_FACT_TYPES, _bank_index_name
 
@@ -54,6 +57,7 @@ class SchemaVectorIndexResult:
     already_present: int = 0
     created: int = 0
     skipped: int = 0  # would-create, reported under --dry-run
+    below_threshold: int = 0  # banks left alone: too small for the configured row threshold
     failed: int = 0
     failed_indexes: list[str] = field(default_factory=list)
 
@@ -116,6 +120,26 @@ async def _repair_schema(
     else:
         banks = await conn.fetch(f"SELECT bank_id, internal_id FROM {qschema}.banks ORDER BY bank_id")  # noqa: S608
     result.banks_scanned = len(banks)
+
+    # A configured row threshold means a small bank is *meant* to have no indexes: repairing it back
+    # would undo the reconciler, and reporting it as missing would flood the result with banks that
+    # are in the state they should be in. One aggregate answers for every bank at once — a full scan
+    # of memory_units, which is nothing next to the index builds this command is here to run.
+    threshold = get_config().per_bank_vector_index_min_rows
+    if threshold > 0 and banks:
+        scope = " WHERE bank_id = $2" if bank_id is not None else ""
+        args = [threshold, bank_id] if bank_id is not None else [threshold]
+        eligible = {
+            row["bank_id"]
+            for row in await conn.fetch(
+                f"SELECT bank_id FROM {qschema}.memory_units{scope} "  # noqa: S608 — schema is a quoted identifier
+                f"GROUP BY bank_id HAVING COUNT(*) >= $1",
+                *args,
+            )
+        }
+        kept = [bank for bank in banks if bank["bank_id"] in eligible]
+        result.below_threshold = len(banks) - len(kept)
+        banks = kept
 
     # Resolve expected index names for every bank, then check them all in one
     # catalog query rather than one round-trip per index.
