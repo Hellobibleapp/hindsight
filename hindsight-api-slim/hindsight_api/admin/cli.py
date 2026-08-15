@@ -676,8 +676,8 @@ def repair_bank(
     Per-bank partial vector indexes are created when a bank is first created
     (instant on an empty bank). Banks that arrive populated — via logical
     restore, a cross-version upgrade, or a vector-extension switch — never hit
-    that path, so their recall silently falls back to a global index +
-    post-filter (slower, under-returning). This command detects missing OR
+    that path, so their recall falls back to an exact scan over the bank's
+    rows, which grows with the bank. This command detects missing OR
     invalid coverage (an INVALID leftover or an index whose access method
     drifted counts as missing) and rebuilds it with CREATE INDEX CONCURRENTLY,
     so it never blocks the live fleet. Idempotent and safe to re-run — the

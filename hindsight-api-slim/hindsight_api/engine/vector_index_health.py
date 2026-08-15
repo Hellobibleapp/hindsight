@@ -4,8 +4,10 @@ Per-(bank, fact_type) partial vector indexes are created only when a bank is
 first created (instant on an empty bank). A bank that becomes *populated*
 outside that fresh-INSERT path — via a logical restore, a cross-version upgrade,
 or a vector-extension switch (e.g. ScaNN→pgvector) — never gets them, so its
-bank-scoped recall silently falls back to the global index + post-filter, which
-is both slower and under-returns results. See issue #2645.
+bank-scoped recall falls back to an exact scan over the bank's rows, which grows
+with the bank. See issue #2645. (Migration f2a6d8c4b1e9 dropped the global
+``memory_units`` vector index on per-bank backends, so there is nothing else to
+fall back to.)
 
 This module is the shared engine for detecting and repairing that gap. It is
 driven by the ``repair-bank`` admin command; the build always uses

@@ -564,8 +564,7 @@ async def import_bank(
         # the bank is still empty (facts are imported below, so the build is
         # instant). get_or_create_bank_profile would NOT do this: the row now
         # exists, so it takes the SELECT branch and skips index creation —
-        # leaving the restored bank falling back to the global index +
-        # post-filter (slower, under-returning recall). See #2645.
+        # leaving the restored bank on an exact scan that grows with it. See #2645.
         internal_id = await conn.fetchval(f"SELECT internal_id FROM {fq_table('banks')} WHERE bank_id = $1", bank_id)
         if internal_id is not None:
             await bank_utils.create_bank_vector_indexes(
