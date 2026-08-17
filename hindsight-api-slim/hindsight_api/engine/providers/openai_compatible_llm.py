@@ -90,6 +90,13 @@ def _validate_ollama_num_ctx(value: Any) -> int | None:
 # intentionally excluded (#1179).
 _TOOL_CHOICE_REQUIRED_UNSUPPORTED_PROVIDERS = frozenset({"lmstudio", "ollama"})
 
+# Hosts documented to accept OpenAI's named tool_choice object
+# ({"type": "function", "function": {"name": ...}}), which lets a forced turn keep
+# the full tools array instead of narrowing it. Same suffix-matching rule and the
+# same host list as the prompt_cache_key allowlist in engine/cache_affinity.py:
+# an unknown OpenAI-compatible backend keeps the portable narrowing path.
+_NAMED_TOOL_CHOICE_DOMAINS = ("openai.com", "openai.azure.com")
+
 # Local providers whose OpenAI-compatible surface always lives under a `/v1`
 # path (LM Studio: http://localhost:1234/v1, Ollama: http://localhost:11434/v1).
 # For these we know the exact endpoint shape, so a bare host base URL can be
@@ -721,6 +728,30 @@ class OpenAICompatibleLLM(LLMInterface):
         """
         return self.provider in _TOOL_CHOICE_REQUIRED_UNSUPPORTED_PROVIDERS
 
+    def _supports_named_tool_choice(self) -> bool:
+        """Whether this endpoint accepts OpenAI's named ``tool_choice`` object.
+
+        Narrowing ``tools`` to the single forced entry is the portable way to force
+        a call, but the tools array is part of the server-side prompt-cache prefix:
+        changing it per turn invalidates the cache for the whole request, so an
+        agent loop that forces a different tool each iteration never reuses its
+        shared prefix. Where the named form is supported the tools array stays
+        constant and only ``tool_choice`` varies, which caches.
+
+        Allowlisted rather than inferred, matching ``_drops_tool_choice_required``:
+        a custom OpenAI-compatible endpoint keeps the narrowing path.
+        """
+        if self.provider != "openai":
+            return False
+        # DeepSeek rejects named/required tool_choice outright (see call_with_tools),
+        # so it must keep the narrowing path regardless of how it is routed.
+        if "deepseek" in self.model.lower():
+            return False
+        hostname = (urlparse(self.base_url).hostname or "") if self.base_url else ""
+        if not hostname:
+            return True
+        return any(hostname == domain or hostname.endswith(f".{domain}") for domain in _NAMED_TOOL_CHOICE_DOMAINS)
+
     def _verification_max_completion_tokens(self) -> int:
         """Return the startup verification budget for OpenAI-compatible gateways."""
         return DEFAULT_VERIFICATION_MAX_COMPLETION_TOKENS
@@ -1292,7 +1323,7 @@ class OpenAICompatibleLLM(LLMInterface):
         """
         start_time = time.time()
 
-        request_tool_choice: str | None
+        request_tool_choice: str | dict[str, Any] | None
         if tool_choice.mode is LLMToolChoiceMode.NAMED:
             forced_name = tool_choice.selected_function_name
             filtered = [tool for tool in tools if tool.get("function", {}).get("name") == forced_name]
@@ -1301,8 +1332,14 @@ class OpenAICompatibleLLM(LLMInterface):
                     f"Named tool_choice must reference exactly one declared tool; "
                     f"found {len(filtered)} definitions for {forced_name!r}"
                 )
-            tools = filtered
-            request_tool_choice = LLMToolChoiceMode.REQUIRED.value
+            if self._supports_named_tool_choice():
+                # Force by name and leave ``tools`` alone: the tools array sits ahead
+                # of the messages in the prompt-cache prefix, so narrowing it here
+                # would cost the whole prefix on every forced turn of an agent loop.
+                request_tool_choice = {"type": "function", "function": {"name": forced_name}}
+            else:
+                tools = filtered
+                request_tool_choice = LLMToolChoiceMode.REQUIRED.value
         elif tool_choice.mode is LLMToolChoiceMode.AUTO:
             request_tool_choice = None
         else:
@@ -1316,11 +1353,11 @@ class OpenAICompatibleLLM(LLMInterface):
 
         # LM Studio and Ollama silently drop tool_choice="required", returning an
         # empty tool_calls array instead of forcing a call (#1563/#1179).
-        # Downgrade to auto (None) so the model still gets to call a tool. Named
-        # tool_choice dicts were already normalized to "required" + a single
-        # filtered tool above, so the call stays practically forced even under
-        # auto. Generic OpenAI-compatible endpoints retain the canonical
-        # ``required`` contract regardless of whether they use a custom base URL.
+        # Downgrade to auto (None) so the model still gets to call a tool. These
+        # endpoints take the narrowing path above, so a named choice reaches here
+        # as "required" + a single filtered tool and the call stays practically
+        # forced even under auto. Generic OpenAI-compatible endpoints retain the
+        # canonical ``required`` contract regardless of a custom base URL.
         if request_tool_choice == LLMToolChoiceMode.REQUIRED.value and self._drops_tool_choice_required():
             request_tool_choice = None
 
