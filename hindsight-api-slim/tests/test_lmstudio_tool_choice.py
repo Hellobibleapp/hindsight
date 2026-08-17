@@ -298,13 +298,13 @@ class TestExpectedFixBehavior:
         assert sent_kwargs["tools"][0]["function"]["name"] == forced_tool_name
 
     @pytest.mark.asyncio
-    async def test_fix_also_applies_to_openai_provider(self):
+    async def test_openai_provider_forces_by_name_without_narrowing(self):
         """
-        The fix is generalized: all providers convert named tool_choice to
-        "required" + filtered tools.  OpenAI natively supports the dict format
-        too, so the behaviour is semantically identical either way. The real
-        OpenAI API (no base_url override) honours "required", so unlike the
-        self-hosted providers it is NOT downgraded.
+        OpenAI natively supports the named dict, so it forces by name and leaves
+        the tools array alone. Narrowing would be semantically equivalent but
+        changes the tools payload on every forced turn, and that payload is part
+        of the server-side prompt-cache prefix — see
+        tests/test_forced_tool_choice_prompt_cache.py.
         """
         from hindsight_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM
 
@@ -329,7 +329,6 @@ class TestExpectedFixBehavior:
             )
 
         sent_kwargs = mock_create.call_args.kwargs
-        # Generalized fix applies to OpenAI too
-        assert sent_kwargs["tool_choice"] == "required"
-        assert len(sent_kwargs["tools"]) == 1
-        assert sent_kwargs["tools"][0]["function"]["name"] == "search_mental_models"
+        # Forced by name, with every declared tool still on the wire.
+        assert sent_kwargs["tool_choice"] == {"type": "function", "function": {"name": "search_mental_models"}}
+        assert len(sent_kwargs["tools"]) == len(REFLECT_TOOLS)
