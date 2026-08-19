@@ -132,6 +132,45 @@ Hindsight supports four PostgreSQL vector extensions:
 - Running on Google **AlloyDB** or **AlloyDB Omni**
 - Want managed ScaNN with `AUTO` mode tuning
 
+#### Limiting vector indexes on large deployments
+
+On `pgvector`, `pgvectorscale` and `vchord`, a bank's memories are indexed per
+`(bank, fact_type)`. By default every bank that holds memories gets its own
+indexes, which is the right thing for most deployments.
+
+It stops being the right thing when you have thousands of banks. These indexes
+all live on one shared table, and PostgreSQL inspects and locks **every** index
+on a table whenever it plans a query against it — so an index created for one
+bank is a cost paid by searches in every other bank. Past a few thousand banks,
+planning slows sharply and the server eventually runs out of lock-table space,
+failing reads *and* bank deletion alike.
+
+Setting a minimum size fixes that: a bank only gets its own indexes once it is
+large enough to benefit from them. Below the threshold PostgreSQL answers the
+same search from the `(bank_id, fact_type)` B-tree plus a top-N sort, which for
+a small bank is both faster and *exact* rather than approximate — so small banks
+lose nothing. The number of indexes becomes proportional to the number of
+**large** banks rather than to the number of banks, and bank count stops being a
+limit.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_VECTOR_INDEX_MIN_ROWS` | Memories a bank needs, in one fact type, before that fact type gets its own vector index. `0` (the default) means no minimum — every bank holding memories is indexed. `10000` is a good starting point for deployments with thousands of banks. | `0` |
+
+Coverage is maintained for you. Every write that could move a bank across the
+threshold queues a background `vector_index_maintenance` operation, which builds
+an index when a bank grows past the threshold and removes it if the bank shrinks
+well below it (the gap between those two points prevents churn at the boundary).
+Bank creation, ingestion and import never build indexes themselves, so no
+request ever waits on index DDL.
+
+To reconcile without waiting for a write — after a restore, an upgrade, or an
+extension switch — run:
+
+```bash
+hindsight-admin repair-bank --all
+```
+
 **Switching extensions:**
 
 If you need to switch from one extension to another:
