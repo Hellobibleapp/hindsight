@@ -871,6 +871,15 @@ class OpenAICompatibleLLM(LLMInterface):
         if self.provider == "minimax":
             extra_body.setdefault("thinking", {"type": "disabled"})
 
+    def _apply_openai_service_tier(self, call_params: dict[str, Any]) -> None:
+        """Send the configured OpenAI tier ("flex" halves every rate) as a native top-level param.
+
+        Only for provider ``openai``: the knob is OpenAI's, and an OpenAI-compatible backend
+        reached through the same class would reject or misread the field.
+        """
+        if self.provider == "openai" and self.openai_service_tier:
+            call_params["service_tier"] = self.openai_service_tier
+
     async def call(
         self,
         messages: list[dict[str, str]],
@@ -979,6 +988,7 @@ class OpenAICompatibleLLM(LLMInterface):
             # Add reasoning parameters for reasoning models
             if is_reasoning_model:
                 extra_body["include_reasoning"] = False
+        self._apply_openai_service_tier(call_params)
         if extra_body:
             call_params["extra_body"] = extra_body
 
@@ -1420,6 +1430,7 @@ class OpenAICompatibleLLM(LLMInterface):
         self._apply_provider_extra_body_defaults(extra_body)
         if self.provider == "groq":
             call_params["seed"] = DEFAULT_LLM_SEED
+        self._apply_openai_service_tier(call_params)
         if extra_body:
             call_params["extra_body"] = extra_body
 
