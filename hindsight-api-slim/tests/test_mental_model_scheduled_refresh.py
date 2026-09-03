@@ -251,3 +251,63 @@ async def test_not_due_model_is_skipped_even_when_stale(memory: MemoryEngine, re
     await MaintenanceLoop(memory)._run_scheduled_mm_refresh()
 
     assert mm_id not in submitted
+
+
+@pytest.mark.asyncio
+async def test_one_croniter_per_expression_not_per_model(memory: MemoryEngine, request_context, monkeypatch):
+    """The due-ness scan builds one croniter per distinct expression, not one per model.
+
+    ``now`` is fixed for the sweep, so every model sharing a cron shares its boundary.
+    Constructing a croniter is the expensive half (parsing and expanding the expression) and
+    this loop has no await in it, so a deployment that puts the same cron on every bank — as
+    many rows as banks — stops servicing the event loop for seconds at a time."""
+    import croniter as croniter_module
+
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        for _ in range(3):
+            await _insert_mm(conn, bank, refresh_cron="*/5 * * * *", last_refreshed_offset="1 day")
+        await _insert_mm(conn, bank, refresh_cron="0 3 * * *", last_refreshed_offset="1 day")
+
+    built: list[str] = []
+    real_croniter = croniter_module.croniter
+
+    def _recording(expr, *args, **kwargs):
+        built.append(expr)
+        return real_croniter(expr, *args, **kwargs)
+
+    monkeypatch.setattr(croniter_module, "croniter", _recording)
+    _patch_submit(memory, monkeypatch)
+    await MaintenanceLoop(memory)._run_scheduled_mm_refresh()
+
+    # Asserted per expression rather than on the whole list: the routine sweeps every bank in
+    # the schema, so models from other tests share the run.
+    assert built.count("*/5 * * * *") == 1
+    assert built.count("0 3 * * *") == 1
+    assert len(built) == len(set(built))
+
+
+@pytest.mark.asyncio
+async def test_invalid_cron_is_reported_once_and_skips_its_models(
+    memory: MemoryEngine, request_context, monkeypatch, caplog
+):
+    """An invalid expression is warned about once, not once per model carrying it, and
+    none of its models are refreshed. A bad cron pushed by config lands on every bank at
+    once, so one line per bank buries the log."""
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        bad = [
+            await _insert_mm(conn, bank, refresh_cron="not a cron", last_refreshed_offset="1 day")
+            for _ in range(3)
+        ]
+        good = await _insert_mm(conn, bank, refresh_cron="*/5 * * * *", last_refreshed_offset="1 day")
+        await _insert_fact(conn, bank)
+
+    submitted = _patch_submit(memory, monkeypatch)
+    with caplog.at_level("WARNING"):
+        await MaintenanceLoop(memory)._run_scheduled_mm_refresh()
+
+    warned = [r for r in caplog.records if "skipping invalid cron 'not a cron'" in r.getMessage()]
+    assert len(warned) == 1
+    assert not [mm for mm in bad if mm in submitted]
+    assert good in submitted
