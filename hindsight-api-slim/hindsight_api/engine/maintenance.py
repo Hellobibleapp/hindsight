@@ -576,17 +576,30 @@ class MaintenanceLoop:
         from croniter import croniter
 
         now = datetime.now(timezone.utc)
+        # One croniter per distinct expression, not per row. `now` is fixed for the sweep, so
+        # rows sharing a cron share its boundary — and a deployment that puts the same cron on
+        # every bank has as many rows as banks. Constructing a croniter is the expensive half
+        # (parsing and expanding the expression), and this loop has no await in it, so at tens
+        # of thousands of rows the sweep stops servicing the event loop for seconds at a time.
+        # None = an invalid expression already reported for this cron.
+        prev_fire_by_cron: dict[str, datetime | None] = {}
         due = []
         for row in rows:
             cron = row["refresh_cron"]
             last = row["last_refreshed_at"]
-            try:
-                prev_fire = croniter(cron, now).get_prev(datetime)
-            except (ValueError, KeyError) as e:
-                logger.warning(
-                    f"Scheduled mental model refresh: skipping invalid cron {cron!r} for "
-                    f"{row['schema_name']}/{row['mental_model_id']}: {e}"
-                )
+            if cron not in prev_fire_by_cron:
+                try:
+                    prev_fire_by_cron[cron] = croniter(cron, now).get_prev(datetime)
+                except (ValueError, KeyError) as e:
+                    prev_fire_by_cron[cron] = None
+                    # Once per expression, not once per row: an invalid cron pushed by config
+                    # lands on every bank at once, and one line per bank buries the log.
+                    logger.warning(
+                        f"Scheduled mental model refresh: skipping invalid cron {cron!r} "
+                        f"(first seen on {row['schema_name']}/{row['mental_model_id']}): {e}"
+                    )
+            prev_fire = prev_fire_by_cron[cron]
+            if prev_fire is None:
                 continue
             if last is None or prev_fire > last:
                 due.append(row)
